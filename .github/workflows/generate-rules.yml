@@ -1,0 +1,99 @@
+# generate-rules.yml
+name: Generate Rules
+
+on:
+  schedule:
+    - cron: '0 0/12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  
+jobs:
+  Generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Clone target repository
+        run: |
+          set -e
+          rm -rf rules/
+          git clone --branch main --depth 1 --filter=blob:none --sparse -- https://github.com/qichiyuhub/rule.git qcy-rules
+          ( cd qcy-rules && git sparse-checkout set rules )
+          git clone --branch meta --depth 1 --filter=blob:none --sparse -- https://github.com/MetaCubeX/meta-rules-dat.git meta-rules
+          ( cd meta-rules && git sparse-checkout set geo )
+          mv qcy-rules/rules ./
+          mv meta-rules/geo ./rules
+          rm -rf qcy-rules meta-rules
+          
+      - name: Configure Git user information
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check if rules content changed
+        id: check
+        run: |
+          git add rules/.
+          if git diff --cached --quiet; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changes detected, will update"
+          fi
+          
+      - name: Commit updated rules directory
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git commit -m "chore: update rules $(date -u '+%Y%m%d%H%M%S')"
+          git push
+          
+      - name: Package rules into zip and tar.gz
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          cd rules
+          zip -r ../rules.zip .
+          tar -czf ../rules.tar.gz .
+          cd ..
+          echo "Packages created:"
+          ls -lh rules.zip rules.tar.gz
+
+      - name: Get source repo commit hash
+        if: steps.check.outputs.changed == 'true'
+        id: srchash
+        run: |
+          echo "hash=$(git ls-tree HEAD rules | head -c 40)" >> $GITHUB_OUTPUT
+          echo "msg=Rules Update $(date -u '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rules-${{ github.run_number }}-${{ github.run_attempt }}
+          name: ${{ steps.srchash.outputs.msg }}
+          body: |
+            Source tree hash: `${{ steps.srchash.outputs.hash }}`
+          files: |
+            rules.zip
+            rules.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Prune old releases
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh --version
+
+          # 获取所有 Release (按创建时间倒序), 跳过前 5 个, 删除其余
+          gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName' \
+            | tail -n +6 \
+            | while read -r tag; do
+                echo "Deleting old release: $tag"
+                gh release delete "$tag" --yes --cleanup-tag || echo "Failed to delete $tag, skipping"
+              done
